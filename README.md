@@ -1,6 +1,6 @@
 #  Bit-Flip Attack (BFA) Research and Experimentation
 
-This repository contains my research, experimental code, and results related to **Bit-Flip Attacks (BFA)** on deep neural networks. The goal is to study the impact of bit-level perturbations on model performance and explore potential defenses.
+This repository contains our research, experimental code, and results related to **Bit-Flip Attacks (BFA)** on deep neural networks. The goal is to study the impact of bit-level perturbations on model performance and explore potential defenses.
 
 ---
 
