@@ -30,7 +30,7 @@ This repo includes:
 - Python 3.x
 - PyTorch / TensorFlow
 - NumPy, Matplotlib, Scikit-learn
-- (Optional) CUDA for GPU acceleration
+- CUDA for GPU acceleration
 
 ---
 
