@@ -106,7 +106,8 @@ def main():
             recon_pack[k] = v.clone()
             continue
 
-        base = k[:-8]
+        SUFFIX = "::qint8"
+        base = k[:-len(SUFFIX)] 
         if base in constraints:
             c = constraints[base]
             orig_q = v if args.fallback_none == "keep_orig" else None
@@ -119,7 +120,8 @@ def main():
             recon_pack[k] = v.clone()
             if base + "::scale" in victim_pack:
                 recon_pack[base + "::scale"] = victim_pack[base + "::scale"].clone()
-
+    print(f"[INFO] used constraints for {len(used)} tensors out of "
+      f"{sum(1 for kk in victim_pack if kk.endswith('::qint8'))}")
     torch.save(recon_pack, args.out)
     print(f"[OK] Wrote CZR-reconstructed int8-packed weights to {args.out}")
 

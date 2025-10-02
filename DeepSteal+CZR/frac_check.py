@@ -1,5 +1,5 @@
 import torch
-ckpt = torch.load("leak_constraints_k2.pt", map_location="cpu")
+ckpt = torch.load("leak_constraints.pt", map_location="cpu")
 cons = ckpt["constraints"]
 
 total = 0
