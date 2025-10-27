@@ -6,4 +6,5 @@ __pycache__/
 *.png
 *.txt
 *.pt
-data/
+data/DeepSteal_CZR/data/*.tar.gz
+DeepSteal_CZR/data/
