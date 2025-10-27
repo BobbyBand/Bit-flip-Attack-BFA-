@@ -5,7 +5,6 @@ import torch
 
 SUFFIX_Q = "::qint8"
 SUFFIX_S = "::scale"
-
 # ----------------- Helpers -----------------
 
 def _load_as_float_state(path: str) -> Dict[str, torch.Tensor]:
