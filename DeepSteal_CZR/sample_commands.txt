@@ -1,0 +1,11 @@
+python simulate_leak.py --weights victim_vgg16_cifar10_int8.pt --full_frac 0.75 --partial_frac 0.15 --partial_top_bits 5 --fully_recover_first_n 15 --fully_recover_bn --seed 7 --out leak_constraints.pt
+
+python frac_check.py 
+
+python czr_reconstruct.py --victim_int8 victim_vgg16_cifar10_int8.pt --constraints leak_constraints.pt --out reconstructed_czr_int8.pt --fallback_none match_moments_per_channel --seed 7
+
+python compare_weights.py --gt victim_vgg16_cifar10_int8.pt --reconstructed reconstructed_czr_int8.pt --constraints leak_constraints.pt
+
+python eval_int8_gt.py --int8_pt reconstructed_czr_int8.pt --device cuda:0 --batch_size 128
+
+python train_vgg16_cifar10.py --device cuda:0 --epochs 20 --batch_size 128 --init_weights reconstructed_czr_int8.pt --constraints leak_constraints.pt --lambda_set2 1e-4 --stats_ema 0.1 --polish_iters 40 --polish_lr_scale 0.1 --gt_weights victim_vgg16_cifar10_int8.pt --out_int8 tuned_int8.pt

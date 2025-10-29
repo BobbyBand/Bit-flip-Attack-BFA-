@@ -4,10 +4,5 @@ __pycache__/
 .venv
 *.csv
 *.png
-*.txt
 *.pt
-data/DeepSteal_CZR/data/*.tar.gz
-DeepSteal_CZR/data/*.tar.gz
-DeepSteal_CZR/data/
-DeepSteal_CZR/data
-DeepSteal_CZR/data/*.tar.gz
+/data
