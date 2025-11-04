@@ -3,6 +3,11 @@ import argparse, random
 from typing import Dict, Tuple, Optional, List
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 import torchvision, torchvision.transforms as T
+import math
+import torch
+import torch.nn.functional as F
+from typing import Dict, Tuple
+
 
 SUFFIX_Q = "::qint8"
 SUFFIX_S = "::scale"
@@ -17,6 +22,101 @@ def set_seed(s=7):
         torch.cuda.manual_seed_all(s)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+
+# ---------- Parameter / state helpers ----------
+def state_to_tensor_flat(state: Dict[str,torch.Tensor], keys=None) -> torch.Tensor:
+    """Concatenate selected parameter tensors into one 1D float32 vector (CPU)."""
+    parts = []
+    for k, v in state.items():
+        if not isinstance(v, torch.Tensor): 
+            continue
+        if keys is not None and k not in keys:
+            continue
+        parts.append(v.detach().cpu().flatten())
+    return torch.cat(parts) if parts else torch.zeros(0, dtype=torch.float32)
+
+def per_layer_weight_mse(stateA: Dict[str,torch.Tensor], stateB: Dict[str,torch.Tensor]):
+    """Return dict name -> (mse, rmse, mae, nparams) for matching keys only."""
+    out = {}
+    for k, vA in stateA.items():
+        if not isinstance(vA, torch.Tensor): 
+            continue
+        vB = stateB.get(k)
+        if vB is None or not isinstance(vB, torch.Tensor):
+            continue
+        a = vA.detach().cpu().float().flatten()
+        b = vB.detach().cpu().float().flatten()
+        if a.numel() != b.numel():
+            continue
+        diff = a - b
+        mse = float((diff * diff).mean().item())
+        rmse = float(math.sqrt(mse))
+        mae = float(diff.abs().mean().item())
+        out[k] = (mse, rmse, mae, a.numel())
+    return out
+
+# ---------- Behavioral / logits helpers ----------
+@torch.no_grad()
+def prediction_agreement_and_logits_metrics(modelA: torch.nn.Module, modelB: torch.nn.Module, loader, device):
+    """Compute agreement rate, average logit MSE, and avg KL (softmax) between two models."""
+    modelA.eval(); modelB.eval()
+    total = 0
+    agree = 0
+    sum_logit_mse = 0.0
+    sum_kl = 0.0
+    for x,y in loader:
+        x = x.to(device)
+        logitsA = modelA(x).detach().cpu()
+        logitsB = modelB(x).detach().cpu()
+        predsA = logitsA.argmax(1)
+        predsB = logitsB.argmax(1)
+        agree += (predsA == predsB).sum().item()
+        total += x.size(0)
+        # MSE on logits
+        diff = logitsA - logitsB
+        sum_logit_mse += float((diff*diff).mean().item()) * x.size(0)
+        # KL: use softmax with small eps
+        p = F.log_softmax(logitsA, dim=1)
+        q = F.softmax(logitsB, dim=1)
+        # kl per sample = sum p * (log p - log q) ; we approximate with torch.nn.functional.kl_div
+        sum_kl += float(F.kl_div(p, q, reduction='batchmean', log_target=False) * x.size(0))
+    return {
+        "agreement": agree / total if total>0 else 0.0,
+        "avg_logit_mse": sum_logit_mse / total if total>0 else 0.0,
+        "avg_kl": sum_kl / total if total>0 else 0.0
+    }
+
+# ---------- Quantized / exact-match helpers ----------
+def int8_exact_match_rate(float_stateA: Dict[str,torch.Tensor], float_stateB: Dict[str,torch.Tensor]):
+    """Quantize both states per-tensor using the same per-tensor scheme and report % exact int8 code matches."""
+    matches = 0
+    total = 0
+    for k, vA in float_stateA.items():
+        if not isinstance(vA, torch.Tensor): continue
+        vB = float_stateB.get(k)
+        if vB is None or not isinstance(vB, torch.Tensor): continue
+        qA, sA = quantize_int8_per_tensor(vA)
+        qB, sB = quantize_int8_per_tensor(vB)
+        # only count if scales are close (optional); here we compare codes regardless
+        total += qA.numel()
+        matches += int((qA.cpu() == qB.cpu()).sum().item())
+    return matches / total if total>0 else 0.0
+
+def sign_agreement_rate(stateA: Dict[str,torch.Tensor], stateB: Dict[str,torch.Tensor]):
+    matches = 0; total = 0
+    for k, vA in stateA.items():
+        if not isinstance(vA, torch.Tensor): continue
+        vB = stateB.get(k)
+        if vB is None or not isinstance(vB, torch.Tensor): continue
+        a = vA.detach().cpu().float().flatten()
+        b = vB.detach().cpu().float().flatten()
+        mask = (a != 0) | (b != 0)
+        if mask.sum().item() == 0:
+            continue
+        matches += int(((a.sign() == b.sign())[mask]).sum().item())
+        total += int(mask.sum().item())
+    return matches / total if total>0 else 0.0
 
 # ----------------------------
 # VGG CIFAR (original, generalized to VGG11/VGG16)
@@ -437,6 +537,42 @@ def main():
         print(f"Final test accuracy: {acc*100:.2f}%  (improved from {init_acc*100:.2f}%)")
     else:
         print(f"Final test accuracy: {acc*100:.2f}%")
+
+    # assume `model` is your trained/reconstructed model and `test_loader` available.
+    # load ground-truth or victim model (if available)
+    gt_state = None
+    if args.gt_weights:
+        gt_state = _load_float_state_from_any(args.gt_weights)
+
+    # build gt model with same backbone & num_classes
+    if gt_state is not None:
+        gt_model = create_model(args.model, num_classes=(100 if args.dataset=="cifar100" else 10)).to(device)
+        gt_model.load_state_dict(gt_state, strict=False)
+
+    # behavioral metrics
+    print("GT test acc:", eval_acc(gt_model, test_loader, device))
+    print("Recon test acc:", eval_acc(model, test_loader, device))
+
+    # agreement & logits
+    logits_stats = prediction_agreement_and_logits_metrics(gt_model, model, test_loader, device)
+    print("Agreement:", logits_stats["agreement"])
+    print("Avg logit MSE:", logits_stats["avg_logit_mse"], "Avg KL:", logits_stats["avg_kl"])
+
+    # param metrics
+    recon_state = model.state_dict()
+    per_layer = per_layer_weight_mse(gt_state, recon_state)
+    # print a concise summary
+    total_mse = sum(v[0]*v[3] for v in per_layer.values()) / max(1, sum(v[3] for v in per_layer.values()))
+    print("Global weight MSE (avg):", total_mse)
+    # show a few worst layers
+    worst = sorted(per_layer.items(), key=lambda kv: kv[1][0], reverse=True)[:6]
+    for k,(mse,rmse,mae,n) in worst:
+        print(f" layer {k}: mse={mse:.6g} rmse={rmse:.6g} mae={mae:.6g} n={n}")
+
+    # quantized / sign agreement
+    print("int8 exact code match rate:", int8_exact_match_rate(gt_state, recon_state))
+    print("sign agreement rate:", sign_agreement_rate(gt_state, recon_state))
+
 
     # Optional GT eval uses the same backbone to avoid mismatches.
     if args.gt_weights:
