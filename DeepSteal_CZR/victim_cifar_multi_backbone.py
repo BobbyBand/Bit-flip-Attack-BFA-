@@ -504,17 +504,19 @@ def main():
     args=ap.parse_args()
 
     set_seed(7)
-    device=args.device if (args.device.startswith("cuda") and torch.cuda.is_available()) else "cpu"
+    device = args.device if (args.device.startswith("cuda") and torch.cuda.is_available()) else "cpu"
     print(f"Device: {device}")
 
     out_float = args.out_float or f"victim_{args.model}_{args.dataset}_float.pt"
     out_int8  = args.out_int8  or f"victim_{args.model}_{args.dataset}_int8.pt"
 
+    # Optional initialization (float or int8-packed)
     init_state = None
     if args.init_weights:
         print(f"[init] loading from {args.init_weights}")
         init_state = _load_float_state_from_any(args.init_weights)
 
+    # Optional constraints
     constraints_dict = None
     if args.constraints:
         cons_pack = torch.load(args.constraints, map_location="cpu")
@@ -525,75 +527,71 @@ def main():
         else:
             raise TypeError(f"Unsupported constraints format in {args.constraints}")
 
-    model,test_loader,init_acc=train(args.epochs, device, args.subset_ratio, args.batch_size,
-                                     model_name=args.model, dataset=args.dataset,
-                                     init_state=init_state, strict_load=args.init_strict,
-                                     constraints=constraints_dict, lambda_set2=args.lambda_set2,
-                                     stats_ema=args.stats_ema, polish_iters=args.polish_iters,
-                                     polish_lr_scale=args.polish_lr_scale,
-                                     freeze_set1=not args.no_freeze_set1)
-    acc=eval_acc(model, test_loader, device)
+    # Train
+    model, test_loader, init_acc = train(
+        args.epochs, device, args.subset_ratio, args.batch_size,
+        model_name=args.model, dataset=args.dataset,
+        init_state=init_state, strict_load=args.init_strict,
+        constraints=constraints_dict, lambda_set2=args.lambda_set2,
+        stats_ema=args.stats_ema, polish_iters=args.polish_iters,
+        polish_lr_scale=args.polish_lr_scale,
+        freeze_set1=not args.no_freeze_set1
+    )
+
+    # Final recon accuracy
+    acc = eval_acc(model, test_loader, device)
     if init_acc is not None:
         print(f"Final test accuracy: {acc*100:.2f}%  (improved from {init_acc*100:.2f}%)")
     else:
         print(f"Final test accuracy: {acc*100:.2f}%")
 
-    # assume `model` is your trained/reconstructed model and `test_loader` available.
-    # load ground-truth or victim model (if available)
-    gt_state = None
-    if args.gt_weights:
-        gt_state = _load_float_state_from_any(args.gt_weights)
-
-    # build gt model with same backbone & num_classes
-    if gt_state is not None:
-        gt_model = create_model(args.model, num_classes=(100 if args.dataset=="cifar100" else 10)).to(device)
-        gt_model.load_state_dict(gt_state, strict=False)
-
-    # behavioral metrics
-    print("GT test acc:", eval_acc(gt_model, test_loader, device))
-    print("Recon test acc:", eval_acc(model, test_loader, device))
-
-    # agreement & logits
-    logits_stats = prediction_agreement_and_logits_metrics(gt_model, model, test_loader, device)
-    print("Agreement:", logits_stats["agreement"])
-    print("Avg logit MSE:", logits_stats["avg_logit_mse"], "Avg KL:", logits_stats["avg_kl"])
-
-    # param metrics
-    recon_state = model.state_dict()
-    per_layer = per_layer_weight_mse(gt_state, recon_state)
-    # print a concise summary
-    total_mse = sum(v[0]*v[3] for v in per_layer.values()) / max(1, sum(v[3] for v in per_layer.values()))
-    print("Global weight MSE (avg):", total_mse)
-    # show a few worst layers
-    worst = sorted(per_layer.items(), key=lambda kv: kv[1][0], reverse=True)[:6]
-    for k,(mse,rmse,mae,n) in worst:
-        print(f" layer {k}: mse={mse:.6g} rmse={rmse:.6g} mae={mae:.6g} n={n}")
-
-    # quantized / sign agreement
-    print("int8 exact code match rate:", int8_exact_match_rate(gt_state, recon_state))
-    print("sign agreement rate:", sign_agreement_rate(gt_state, recon_state))
-
-
-    # Optional GT eval uses the same backbone to avoid mismatches.
+    # ---- Ground-truth / fidelity metrics (only if provided) ----
     if args.gt_weights:
         print(f"[gt] evaluating {args.gt_weights}")
         gt_state = _load_float_state_from_any(args.gt_weights)
-        gt_model = create_model(args.model, num_classes=model.fc.out_features if hasattr(model, "fc") else model.classifier.out_features).to(device)
+
+        # Build GT model with the same backbone and class count
+        num_classes = 100 if args.dataset.lower() == "cifar100" else 10
+        gt_model = create_model(args.model, num_classes=num_classes).to(device)
         gt_res = gt_model.load_state_dict(gt_state, strict=False)
         if getattr(gt_res, "missing_keys", None):
             print(f"[gt] missing keys ({len(gt_res.missing_keys)}): {gt_res.missing_keys[:5]}")
         if getattr(gt_res, "unexpected_keys", None):
             print(f"[gt] unexpected keys ({len(gt_res.unexpected_keys)}): {gt_res.unexpected_keys[:5]}")
-        gt_acc = eval_acc(gt_model, test_loader, device)
-        print(f"[gt] accuracy: {gt_acc*100:.2f}%")
+
+        # Behavioral metrics
+        print("GT test acc:", eval_acc(gt_model, test_loader, device))
+        print("Recon test acc:", acc)
+
+        # Agreement & logits
+        logits_stats = prediction_agreement_and_logits_metrics(gt_model, model, test_loader, device)
+        print("Agreement:", logits_stats["agreement"])
+        print("Avg logit MSE:", logits_stats["avg_logit_mse"], "Avg KL:", logits_stats["avg_kl"])
+
+        # Parameter metrics
+        recon_state = model.state_dict()
+        per_layer = per_layer_weight_mse(gt_state, recon_state)
+        total_mse = sum(v[0]*v[3] for v in per_layer.values()) / max(1, sum(v[3] for v in per_layer.values()))
+        print("Global weight MSE (avg):", total_mse)
+        worst = sorted(per_layer.items(), key=lambda kv: kv[1][0], reverse=True)[:6]
+        for k,(mse,rmse,mae,n) in worst:
+            print(f" layer {k}: mse={mse:.6g} rmse={rmse:.6g} mae={mae:.6g} n={n}")
+
+        # Quantized / sign agreement
+        print("int8 exact code match rate:", int8_exact_match_rate(gt_state, recon_state))
+        print("sign agreement rate:", sign_agreement_rate(gt_state, recon_state))
+
+        # Deltas
         if init_acc is not None:
-            diff_init = (init_acc - gt_acc) * 100.0
+            diff_init = (init_acc - eval_acc(gt_model, test_loader, device)) * 100.0
             print(f"[delta] init - GT: {diff_init:+.2f} pts")
-        diff_trained = (acc - gt_acc) * 100.0
+        diff_trained = (acc - eval_acc(gt_model, test_loader, device)) * 100.0
         print(f"[delta] trained - GT: {diff_trained:+.2f} pts")
 
+    # Save artifacts
     torch.save(model.state_dict(), out_float); print(f"[float] wrote: {out_float}")
     save_int8_state_from_state_dict(model.state_dict(), out_int8)
+
 
 if __name__=="__main__": 
     main()
