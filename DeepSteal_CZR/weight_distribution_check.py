@@ -2,11 +2,11 @@ import torch
 import matplotlib.pyplot as plt
 
 # Load float model weights
-state_f = torch.load("victim_vgg16_cifar10_float.pt", map_location="cpu")
+state_f = torch.load("victim_resnet18_cifar10_float.pt", map_location="cpu")
 weights_f = state_f["features.18.weight"].flatten().float()
 
 # Load int8 model weights
-state_q = torch.load("victim_vgg16_cifar10_int8.pt", map_location="cpu")
+state_q = torch.load("victim_resnet18_cifar10_int8.pt", map_location="cpu")
 weights_q = state_q["features.18.weight::qint8"].flatten().float()  # may be torch.int8
 
 # If weights_q is int8, convert to float for plotting
