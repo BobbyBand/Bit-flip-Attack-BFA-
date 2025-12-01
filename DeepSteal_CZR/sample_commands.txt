@@ -4,6 +4,8 @@ python frac_check.py --ckpt
 
 python czr_reconstruct.py --victim_int8 victim_vgg16_cifar10_int8.pt --constraints leak_constraints_vgg16.pt --out reconstructed_czr_int8_vgg16.pt --fallback_none map_laplace --seed 7
 
+python czr_reconstruct.py --victim_int8 victim_resnet34_cifar10_int8.pt --constraints leak_constraints_resnet34.pt --fallback_none map_laplace  --out recon_set2_maplaplace_set3_maplaplace_resnet34.pt
+
 python compare_weights.py --gt victim_vgg16_cifar10_int8.pt --reconstructed reconstructed_czr_int8_vgg16.pt --constraints leak_constraints_vgg16.pt
 
 python eval_int8_gt.py --int8_pt reconstructed_czr_int8.pt --device cuda:0 --batch_size 128

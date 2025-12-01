@@ -301,6 +301,114 @@ def reconstruct_set2(
 
     return q_out
 
+def reconstruct_set2_map_gaussian(c: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """
+    Set-2 reconstruction variant that fills Set-2 positions with the
+    per-channel mean of known int8 codes (same estimator as the
+    'map_gaussian' Set-3 fallback).
+
+    Only positions where c["mask_part"] is True are written; all other
+    positions remain zero.
+    """
+    device = c["full_min"].device
+    scale = float(c["scale"])
+    shape = c["full_min"].shape
+    q_out = torch.zeros(shape, dtype=torch.int8, device=device)
+    mask_part = c["mask_part"]
+
+    # Reuse the same location estimator as the Set-3 'map_gaussian' fallback.
+    locs = _per_channel_loc_from_known(c, scale, loc="mean")
+
+    if locs.ndim == 0:
+        # Single global location
+        q_fill = torch.round(locs).clamp(-128, 127).to(torch.int8)
+        q_out[mask_part] = q_fill
+    else:
+        # Per-channel locations
+        q_fill = torch.round(locs).clamp(-128, 127).to(torch.int8)
+        # Broadcast over spatial / in-channel dims
+        expand_shape = (q_fill.shape[0],) + (1,) * max(len(shape) - 1, 0)
+        q_base = q_fill.reshape(expand_shape)
+        q_out[mask_part] = q_base.expand_as(q_out)[mask_part]
+
+    return q_out
+
+
+def reconstruct_set2_map_laplace(c: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """
+    Set-2 reconstruction variant that fills Set-2 positions with a discrete
+    MAP estimate under a Laplace prior, using the same logic as the
+    'map_laplace' Set-3 fallback but targeting mask_part instead of mask_none.
+
+    Only positions where c["mask_part"] is True are written; all other
+    positions remain zero.
+    """
+    device = c["full_min"].device
+    scale = float(c["scale"])
+    shape = c["full_min"].shape
+    q_out = torch.zeros(shape, dtype=torch.int8, device=device)
+
+    mfull = c["mask_full"]
+    mpart = c["mask_part"]
+
+    # Build int16 known code tensor aligned with shape
+    q_known = torch.zeros(shape, dtype=torch.int16, device=device)
+    if mfull.any():
+        q_known[mfull] = torch.round(
+            c["full_mean"][mfull] / scale
+        ).clamp(-128, 127).to(torch.int16)
+    if mpart.any():
+        mids = (c["part_min"] + c["part_max"]) * 0.5
+        q_known[mpart] = torch.round(
+            mids[mpart] / scale
+        ).clamp(-128, 127).to(torch.int16)
+
+    # Candidate code grid (full int8 range)
+    codes = torch.arange(-128, 128, dtype=torch.int16, device=device).to(torch.float32)
+
+    def fit_laplace_codes(qc: torch.Tensor):
+        # Fit Laplace on codes directly (robust): mu = median, b = mean(|x-mu|)
+        mu = qc.median()
+        b = (qc - mu).abs().mean().clamp_min(1e-6)
+        return mu.item(), b.item()
+
+    # Scalar / no channel dimension: treat whole tensor at once
+    if q_out.ndim == 0 or shape[0] == 0:
+        known_vec = q_known[(mfull | mpart)]
+        if known_vec.numel() == 0:
+            # No known codes at all: fall back to zero in Set-2
+            q_out[mpart] = 0
+        else:
+            mu, b = fit_laplace_codes(known_vec.to(torch.float32))
+            # Optional zero snap in code space
+            if abs(mu) < 0.25:  # quarter-code tolerance
+                mu = 0.0
+            logp = - (codes - mu).abs() / b - math.log(2.0 * b)
+            best_code = codes[torch.argmax(logp)].round().clamp(-128, 127).to(torch.int8)
+            q_out[mpart] = best_code
+    else:
+        # Per-output-channel MAP, same structure as Set-3 'map_laplace'
+        OC = shape[0]
+        for oc in range(OC):
+            sel_known = (mfull | mpart)[oc]
+            sel_part = mpart[oc]
+            if not sel_part.any():
+                continue
+            if not sel_known.any():
+                # No stats for this channel: default to zero
+                q_out[oc][sel_part] = 0
+                continue
+            qc = q_known[oc][sel_known].to(torch.float32)
+            mu, b = fit_laplace_codes(qc)
+            if abs(mu) < 0.25:
+                mu = 0.0
+            logp = - (codes - mu).abs() / b - math.log(2.0 * b)
+            best_code = codes[torch.argmax(logp)].round().clamp(-128, 127).to(torch.int8)
+            q_out[oc][sel_part] = best_code
+
+    return q_out
+
+
 
 def czr_int8_from_constraints(
     c: Dict[str, torch.Tensor],
@@ -372,6 +480,12 @@ def czr_int8_from_constraints(
         if set2_strategy == "czr":
             # Your current closer-to-zero reconstruction (B3FA-style).
             q_set2 = reconstruct_set2(part_min, part_max, mask_part, scale)
+
+        elif set2_strategy == "map_gaussian":
+            q_set2 = reconstruct_set2_map_gaussian(c)
+
+        elif set2_strategy == "map_laplace":
+            q_set2 = reconstruct_set2_map_laplace(c)
 
         elif set2_strategy == "deepsteal_mid":
             # DeepSteal-style init: take the midpoint of the projected range
@@ -484,6 +598,19 @@ def czr_int8_from_constraints(
                     logp = - (codes - mu).abs() / b - math.log(2.0 * b)
                     best_code = codes[torch.argmax(logp)].round().clamp(-128,127).to(torch.int8)
                     q_out[oc][sel_none] = best_code
+        elif fallback_strategy == "random":
+            # Uniform random int8 codes in [-128,127]
+            g = torch.Generator(device=device).manual_seed(seed)
+            n = int(mask_none.sum().item())
+            # Draw from uniform integer range
+            rand_codes = torch.randint(
+                low=-128, high=128,
+                size=(n,),
+                dtype=torch.int8,
+                generator=g,
+                device=device
+            )
+            q_out[mask_none] = rand_codes
         else:
             raise ValueError(f"Unknown fallback_strategy: {fallback_strategy}")
 
@@ -652,15 +779,17 @@ def main():
     ap.add_argument("--out", default="reconstructed_czr_int8.pt",
                     help="Output path for reconstructed int8-packed weights")
     ap.add_argument("--fallback_none", default="keep_orig",
-                    choices=["keep_orig", "zeros", "gaussian", "match_moments", "match_moments_per_channel", "map_gaussian", "map_laplace"],
+                    choices=["keep_orig", "zeros", "gaussian", "match_moments", "match_moments_per_channel", "map_gaussian", "map_laplace", "random"],
                     help="Strategy for Set-3 weights")
     ap.add_argument(
         "--set2_strategy",
         default="czr",
-        choices=["czr", "deepsteal_mid"],
+        choices=["czr", "deepsteal_mid", "map_gaussian", "map_laplace"],
         help="How to reconstruct Set-2 weights: "
              "'czr' = closer-to-zero (B3FA), "
              "'deepsteal_mid' = quantised midpoint as in DeepSteal init."
+             "'map_gaussian' (per-channel mean of known codes), "
+             "'map_laplace' (discrete MAP Laplace prior)."
     )
     ap.add_argument("--seed", type=int, default=7, help="RNG seed for stochastic fallbacks")
     args = ap.parse_args()
